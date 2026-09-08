@@ -325,6 +325,12 @@ async fn dispatch_edit(
         .as_ref()
         .and_then(|v| v.get("due"))
         .map(|d| d.as_str().unwrap_or("").to_string());
+    // Subtasks: present parent_uid means set/change the parent; an empty value
+    // explicitly clears it. Absent keeps the server's current relationship.
+    let parent_uid: Option<String> = payload
+        .as_ref()
+        .and_then(|v| v.get("parent_uid"))
+        .map(|p| p.as_str().unwrap_or("").trim().to_string());
 
     let cached = match fetch_cached_for_dispatch(conn, &op.target_calendar_href, &op.target_uid) {
         Ok(opt) => opt,
@@ -341,6 +347,7 @@ async fn dispatch_edit(
 
     let new_summary_for_closure = new_summary.clone();
     let due_for_closure = due.clone();
+    let parent_for_closure = parent_uid.clone();
     match crate::nextcloud::put_task_with_retry(
         http,
         &task_url,
@@ -348,12 +355,22 @@ async fn dispatch_edit(
         &cached_etag,
         &cached_ical,
         move |ical| {
-            let s = crate::nextcloud::replace_summary(ical, &new_summary_for_closure);
+            let mut s = crate::nextcloud::replace_summary(ical, &new_summary_for_closure);
             // Re-apply DUE on a 412 re-derive so a conflict can't drop the date.
-            Ok(match &due_for_closure {
-                Some(token) => crate::nextcloud::set_due(&s, token),
-                None => s,
-            })
+            if let Some(token) = &due_for_closure {
+                s = crate::nextcloud::set_due(&s, token);
+            }
+            // Likewise, preserve a queued parent change if the server changed
+            // the task between our optimistic cache edit and the PUT.
+            if let Some(parent_uid) = &parent_for_closure {
+                let parent = if parent_uid.is_empty() {
+                    None
+                } else {
+                    Some(parent_uid.as_str())
+                };
+                s = crate::nextcloud::set_parent_uid(&s, parent);
+            }
+            Ok(s)
         },
     )
     .await
