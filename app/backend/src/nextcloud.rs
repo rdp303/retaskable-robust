@@ -1264,6 +1264,105 @@ fn extract_xprop(ical_text: &str, prefix: &str) -> Option<String> {
     None
 }
 
+/// Return the parent task UID from a standard RFC 5545 RELATED-TO property.
+///
+/// reTaskable writes subtasks as:
+/// `RELATED-TO;RELTYPE=PARENT:<parent uid>`.
+/// RFC 5545 defines PARENT as the default RELTYPE, so we also accept a bare
+/// `RELATED-TO:<uid>`. CHILD/SIBLING relationships are intentionally ignored.
+/// The relation is read from the cached raw iCalendar body so no database schema
+/// change is required for subtask v1.
+pub fn extract_parent_uid(ical_text: &str) -> Option<String> {
+    let unfolded = unfold_ical(ical_text);
+    for line in unfolded.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
+        let head = &line[..colon];
+        let mut parts = head.split(';');
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("RELATED-TO") {
+            continue;
+        }
+
+        let mut reltype: Option<&str> = None;
+        for param in parts {
+            if let Some((key, value)) = param.split_once('=') {
+                if key.eq_ignore_ascii_case("RELTYPE") {
+                    reltype = Some(value.trim_matches('"'));
+                }
+            }
+        }
+        if reltype.is_some_and(|v| !v.eq_ignore_ascii_case("PARENT")) {
+            continue;
+        }
+
+        let value = unescape_ical_text(line[colon + 1..].trim());
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Set, replace, or clear the VTODO parent relationship.
+///
+/// A non-empty parent UID is stored using the standard RFC 5545 form
+/// `RELATED-TO;RELTYPE=PARENT:<uid>`. Passing `None` (or an empty UID)
+/// removes only PARENT/default RELATED-TO properties while preserving any
+/// unrelated CHILD/SIBLING relationships a server or another client may use.
+///
+/// The function is intentionally idempotent: applying the same parent twice
+/// produces a single parent relationship.
+pub fn set_parent_uid(ical_text: &str, parent_uid: Option<&str>) -> String {
+    let ical_text = ensure_crlf(&unfold_ical(ical_text));
+    let parent_uid = parent_uid.map(str::trim).filter(|s| !s.is_empty());
+    let mut out = String::with_capacity(ical_text.len() + 80);
+
+    for raw_line in ical_text.split("\r\n") {
+        let line = raw_line.trim_end_matches('\r');
+
+        // Remove an existing PARENT relationship (including bare RELATED-TO,
+        // whose default RELTYPE is PARENT). Leave CHILD/SIBLING relations alone.
+        if let Some(colon) = line.find(':') {
+            let head = &line[..colon];
+            let mut parts = head.split(';');
+            let name = parts.next().unwrap_or("");
+            if name.eq_ignore_ascii_case("RELATED-TO") {
+                let mut reltype: Option<&str> = None;
+                for param in parts {
+                    if let Some((key, value)) = param.split_once('=') {
+                        if key.eq_ignore_ascii_case("RELTYPE") {
+                            reltype = Some(value.trim_matches('"'));
+                        }
+                    }
+                }
+                if reltype.is_none() || reltype.is_some_and(|v| v.eq_ignore_ascii_case("PARENT")) {
+                    continue;
+                }
+            }
+        }
+
+        if line.eq_ignore_ascii_case("END:VTODO") {
+            if let Some(parent_uid) = parent_uid {
+                out.push_str("RELATED-TO;RELTYPE=PARENT:");
+                out.push_str(&escape_ical_text(parent_uid));
+                out.push_str("\r\n");
+            }
+        }
+
+        if !line.is_empty() {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+    }
+
+    ensure_crlf(&out)
+}
+
 fn matching_mutation<'a>(
     line: &str,
     mutations: &'a [(&'a str, Option<String>)],
@@ -1408,6 +1507,7 @@ pub fn format_tasks_json(
     marks: &HashMap<String, bool>,
     sources: &HashMap<String, String>,
     anchors: &HashMap<String, (String, String)>,
+    parents: &HashMap<String, String>,
     last_synced: Option<&str>,
     conflicts: i64,
 ) -> String {
@@ -1435,6 +1535,9 @@ pub fn format_tasks_json(
                 "due": t.due,
                 "mark": mark,
                 "source": sources.get(&t.uid).cloned().unwrap_or_default(),
+                // Subtask v1: empty for top-level tasks, otherwise the UID of
+                // the task referenced by RELATED-TO;RELTYPE=PARENT.
+                "parent_uid": parents.get(&t.uid).cloned().unwrap_or_default(),
                 // M15 machine anchor for jump-back: doc UUID + page key ("idx:N").
                 // Empty strings when absent (never null) so QML keys off length.
                 "doc": doc,
@@ -1565,10 +1668,11 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_calendars, due_property_line, ensure_crlf, escape_ical_text, extract_source_doc,
-        extract_source_label, extract_source_page, filter_for_display, format_tasks_json, get_task,
-        is_icloud_caldav_host, parse_sync_response, redirect_allowed, replace_summary, set_due,
-        sync_collection_unsupported, unescape_ical_text, parse_vtodos,
+        discover_calendars, due_property_line, ensure_crlf, escape_ical_text, extract_parent_uid,
+        extract_source_doc, extract_source_label, extract_source_page, filter_for_display,
+        format_tasks_json, get_task, is_icloud_caldav_host, parse_sync_response, parse_vtodos,
+        redirect_allowed, replace_summary, set_due, set_parent_uid, sync_collection_unsupported,
+        unescape_ical_text,
     };
     use crate::config::NextcloudConfig;
 
@@ -2150,6 +2254,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             0,
         );
@@ -2182,6 +2287,7 @@ mod tests {
             &marks,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             Some("Last synced 5 minutes ago."),
             0,
         );
@@ -2206,7 +2312,15 @@ mod tests {
         let tasks = vec![task("uid-A", "Buy milk")];
         let mut marks = HashMap::new();
         marks.insert("uid-A".to_string(), true);
-        let out = format_tasks_json(&tasks, &marks, &HashMap::new(), &HashMap::new(), None, 3);
+        let out = format_tasks_json(
+            &tasks,
+            &marks,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            3,
+        );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["tasks"][0]["mark"], "!");
         assert_eq!(v["conflicts"], 3);
@@ -2222,7 +2336,15 @@ mod tests {
             "uid-A".to_string(),
             ("doc-uuid-123".to_string(), "idx:2".to_string()),
         );
-        let out = format_tasks_json(&tasks, &HashMap::new(), &sources, &anchors, None, 0);
+        let out = format_tasks_json(
+            &tasks,
+            &HashMap::new(),
+            &sources,
+            &anchors,
+            &HashMap::new(),
+            None,
+            0,
+        );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let arr = v["tasks"].as_array().unwrap();
         // uid-A and uid-B both open + undated, so href tiebreak keeps input order.
@@ -2234,6 +2356,24 @@ mod tests {
         assert_eq!(arr[1]["source"], ""); // absent -> empty string, never null
         assert_eq!(arr[1]["doc"], ""); // absent anchor -> empty strings, never null
         assert_eq!(arr[1]["page"], "");
+    }
+
+    #[test]
+    fn format_tasks_json_carries_parent_uid() {
+        let tasks = vec![task("child-1", "Call contractor")];
+        let mut parents = HashMap::new();
+        parents.insert("child-1".to_string(), "parent-1".to_string());
+        let out = format_tasks_json(
+            &tasks,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &parents,
+            None,
+            0,
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["tasks"][0]["parent_uid"], "parent-1");
     }
 
     #[test]
@@ -2279,6 +2419,51 @@ mod tests {
         assert_eq!(extract_source_label(ical), None);
         assert_eq!(extract_source_doc(ical), None);
         assert_eq!(extract_source_page(ical), None);
+    }
+
+    #[test]
+    fn extract_parent_uid_reads_explicit_parent_relation() {
+        let ical = "BEGIN:VTODO\r\nUID:child-1\r\nRELATED-TO;RELTYPE=PARENT:parent-1\r\nEND:VTODO\r\n";
+        assert_eq!(extract_parent_uid(ical).as_deref(), Some("parent-1"));
+    }
+
+    #[test]
+    fn extract_parent_uid_accepts_default_parent_and_ignores_child_relation() {
+        let default_parent =
+            "BEGIN:VTODO\r\nUID:child-1\r\nRELATED-TO:parent-1\r\nEND:VTODO\r\n";
+        assert_eq!(
+            extract_parent_uid(default_parent).as_deref(),
+            Some("parent-1")
+        );
+
+        let child_relation =
+            "BEGIN:VTODO\r\nUID:parent-1\r\nRELATED-TO;RELTYPE=CHILD:child-1\r\nEND:VTODO\r\n";
+        assert_eq!(extract_parent_uid(child_relation), None);
+    }
+
+    #[test]
+    fn set_parent_uid_adds_replaces_and_clears_parent_relation() {
+        let base = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:child-1\r\nSUMMARY:Child\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let added = set_parent_uid(base, Some("parent-1"));
+        assert_eq!(extract_parent_uid(&added).as_deref(), Some("parent-1"));
+        assert_eq!(added.matches("RELATED-TO;RELTYPE=PARENT:").count(), 1);
+
+        let replaced = set_parent_uid(&added, Some("parent-2"));
+        assert_eq!(extract_parent_uid(&replaced).as_deref(), Some("parent-2"));
+        assert_eq!(replaced.matches("RELATED-TO;RELTYPE=PARENT:").count(), 1);
+
+        let cleared = set_parent_uid(&replaced, None);
+        assert_eq!(extract_parent_uid(&cleared), None);
+        assert!(!cleared.contains("RELATED-TO;RELTYPE=PARENT:"));
+    }
+
+    #[test]
+    fn set_parent_uid_preserves_non_parent_relations() {
+        let ical = "BEGIN:VTODO\r\nUID:x\r\nRELATED-TO;RELTYPE=CHILD:child-1\r\nRELATED-TO;RELTYPE=PARENT:old-parent\r\nEND:VTODO\r\n";
+        let out = set_parent_uid(ical, Some("new-parent"));
+        assert!(out.contains("RELATED-TO;RELTYPE=CHILD:child-1"));
+        assert!(out.contains("RELATED-TO;RELTYPE=PARENT:new-parent"));
+        assert!(!out.contains("old-parent"));
     }
 
     fn task_with_status(uid: &str, status: TaskStatus) -> Task {

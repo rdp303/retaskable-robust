@@ -39,6 +39,7 @@ const MSG_LIST_SOURCES: u32 = 22;
 const MSG_SELECT_SOURCE: u32 = 23;
 const MSG_TRANSFER_TASK: u32 = 24;
 const MSG_GET_DIAGNOSTICS: u32 = 25;
+const MSG_SET_PARENT_BY_UID: u32 = 26;
 const MSG_PONG: u32 = 101;
 const MSG_NEXTCLOUD_RESPONSE: u32 = 102;
 const MSG_CALENDARS_RESPONSE: u32 = 103;
@@ -64,6 +65,7 @@ const MSG_LIST_SOURCES_RESPONSE: u32 = 122;
 const MSG_SELECT_SOURCE_RESPONSE: u32 = 123;
 const MSG_TRANSFER_TASK_RESPONSE: u32 = 124;
 const MSG_GET_DIAGNOSTICS_RESPONSE: u32 = 125;
+const MSG_SET_PARENT_BY_UID_RESPONSE: u32 = 126;
 
 #[tokio::main]
 async fn main() {
@@ -404,6 +406,18 @@ impl AppLoadBackend for Backend {
                     &diagnostics::read_tail(80).unwrap_or_else(|e| format!("error: {e:#}")),
                 );
             }
+            MSG_SET_PARENT_BY_UID => {
+                eprintln!(
+                    "retaskable: set-parent-by-uid requested ({} chars)",
+                    msg.contents.len()
+                );
+                let response = match set_parent_by_uid(&mut self.db, &msg.contents) {
+                    Ok(s) => s,
+                    Err(e) => format!("error: {e:#}"),
+                };
+                eprintln!("retaskable: set-parent-by-uid result:\n{response}");
+                send(replier, MSG_SET_PARENT_BY_UID_RESPONSE, &response);
+            }
             t => eprintln!("retaskable: ignoring unknown msg type {t}"),
         }
     }
@@ -495,6 +509,7 @@ fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<St
     let marks = db::pending_marks(db, &cal_href)?;
     let sources = db::source_labels(db, &cal_href)?;
     let anchors = db::source_anchors(db, &cal_href)?;
+    let parents = db::parent_uids(db, &cal_href)?;
     let last_synced = if db::is_local_list(&cal_href) {
         Some("Stored on this reMarkable.".to_string())
     } else {
@@ -506,6 +521,7 @@ fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<St
         &marks,
         &sources,
         &anchors,
+        &parents,
         last_synced.as_deref(),
         conflicts,
     ))
@@ -1940,6 +1956,84 @@ fn edit_by_uid_inner(
     }
 }
 
+/// MSG_SET_PARENT_BY_UID handler. Payload:
+/// `{"uid":"child uid","parent_uid":"parent uid"}`.
+/// An empty parent_uid makes the task top-level again.
+fn set_parent_by_uid(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
+    let v: serde_json::Value = serde_json::from_str(payload)?;
+    let uid = v.get("uid").and_then(|x| x.as_str()).unwrap_or("").trim();
+    let parent_uid = v
+        .get("parent_uid")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim();
+    if uid.is_empty() {
+        anyhow::bail!("uid cannot be empty");
+    }
+    if uid == parent_uid {
+        anyhow::bail!("a task cannot be its own parent");
+    }
+
+    let cal_href = active_list_href(db)?;
+    let parent = if parent_uid.is_empty() {
+        None
+    } else {
+        Some(parent_uid)
+    };
+    set_parent_by_uid_inner(db, &cal_href, uid, parent)
+}
+
+/// Validate the one-level subtask invariant, then queue (or locally finalize)
+/// the relationship change without changing either task's UID.
+fn set_parent_by_uid_inner(
+    db: &mut Connection,
+    cal_href: &str,
+    uid: &str,
+    parent_uid: Option<&str>,
+) -> anyhow::Result<String> {
+    let task = db::get_cached_task_by_uid(db, cal_href, uid)?
+        .ok_or_else(|| anyhow::anyhow!("no task with uid {uid}"))?;
+    let current_parent = nextcloud::extract_parent_uid(&task.ical_text);
+
+    if let Some(parent_uid) = parent_uid {
+        if parent_uid == uid {
+            anyhow::bail!("a task cannot be its own parent");
+        }
+        let parent = db::get_cached_task_by_uid(db, cal_href, parent_uid)?
+            .ok_or_else(|| anyhow::anyhow!("parent task not found"))?;
+        if nextcloud::extract_parent_uid(&parent.ical_text).is_some() {
+            anyhow::bail!("subtasks cannot be used as parents in v1");
+        }
+
+        // v1 intentionally supports one level. A task that already owns
+        // children cannot itself be nested under another task.
+        let relationships = db::parent_uids(db, cal_href)?;
+        if relationships.values().any(|p| p == uid) {
+            anyhow::bail!("a task with subtasks cannot become a subtask in v1");
+        }
+
+        if current_parent.as_deref() == Some(parent_uid) {
+            return Ok("Task is already under that parent.".to_string());
+        }
+    } else if current_parent.is_none() {
+        return Ok("Task is already top-level.".to_string());
+    }
+
+    if db::is_local_list(cal_href) {
+        db::set_parent_local(db, uid, parent_uid)?;
+        Ok(match parent_uid {
+            Some(_) => format!("Made \"{}\" a subtask.", task.summary),
+            None => format!("Made \"{}\" top-level.", task.summary),
+        })
+    } else {
+        let op_id = db::enqueue_set_parent(db, cal_href, uid, parent_uid)?;
+        Ok(match parent_uid {
+            Some(_) => format!("Queued: make \"{}\" a subtask (#{op_id})", task.summary),
+            None => format!("Queued: make \"{}\" top-level (#{op_id})", task.summary),
+        })
+    }
+}
+
 /// MSG_DELETE_BY_UID handler. Deletes a specific task by UID (the one the
 /// detail dialog opened), mirroring `toggle_by_uid`. Payload is the bare uid
 /// string. Thin config/calendar wrapper around `delete_by_uid_inner`.
@@ -2287,38 +2381,70 @@ async fn discover_with_inner(payload: &str) -> anyhow::Result<Vec<nextcloud::Cal
 }
 
 fn create(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
-    // M16: payload is JSON `{summary, due}`. Fall back to treating the whole
-    // payload as a bare summary (no due) so a pre-M16 plain-string sender still
-    // works. `due` is the normalized token ("" / YYYYMMDD / YYYYMMDDTHHMMSS).
-    let (summary_owned, due_owned) = match serde_json::from_str::<serde_json::Value>(payload) {
-        Ok(v) if v.is_object() => {
-            let s = v
-                .get("summary")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            let d = v
-                .get("due")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            (s, d)
-        }
-        _ => (payload.to_string(), String::new()),
-    };
+    // Subtask v1 extends the M16 JSON payload to {summary, due, parent_uid}.
+    // Bare-string senders remain supported and create top-level tasks.
+    let (summary_owned, due_owned, parent_uid_owned) =
+        match serde_json::from_str::<serde_json::Value>(payload) {
+            Ok(v) if v.is_object() => {
+                let s = v
+                    .get("summary")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let d = v
+                    .get("due")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let p = v
+                    .get("parent_uid")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (s, d, p)
+            }
+            _ => (payload.to_string(), String::new(), String::new()),
+        };
     let summary = summary_owned.trim();
     if summary.is_empty() {
         anyhow::bail!("summary cannot be empty");
     }
     let due = due_owned.trim();
     let due_opt = if due.is_empty() { None } else { Some(due) };
+    let parent_uid = parent_uid_owned.trim();
+    let parent_uid_opt = if parent_uid.is_empty() {
+        None
+    } else {
+        Some(parent_uid)
+    };
 
     let cal_href = active_list_href(db)?;
 
+    if let Some(parent_uid) = parent_uid_opt {
+        let parent = db::get_cached_task_by_uid(db, &cal_href, parent_uid)?;
+        if parent.is_none() {
+            anyhow::bail!("parent task not found");
+        }
+        // V1 deliberately supports one nesting level. The UI already hides
+        // "Add subtask" on child tasks; keep the invariant in the backend too.
+        if db::parent_uids(db, &cal_href)?.contains_key(parent_uid) {
+            anyhow::bail!("subtasks v1 supports one level of nesting");
+        }
+    }
+
     let uid = Uuid::new_v4().to_string();
     if db::is_local_list(&cal_href) {
-        db::create_local_with_anchor(db, &uid, summary, None, due_opt)?;
-        Ok(format!("Created local task \"{summary}\""))
+        if let Some(parent_uid) = parent_uid_opt {
+            db::create_local_subtask(db, &uid, summary, parent_uid, due_opt)?;
+            Ok(format!("Created local subtask \"{summary}\""))
+        } else {
+            db::create_local_with_anchor(db, &uid, summary, None, due_opt)?;
+            Ok(format!("Created local task \"{summary}\""))
+        }
+    } else if let Some(parent_uid) = parent_uid_opt {
+        let op_id =
+            db::enqueue_create_subtask(db, &cal_href, &uid, summary, parent_uid, due_opt)?;
+        Ok(format!("Queued: create subtask \"{summary}\" (#{op_id})"))
     } else {
         let op_id = db::enqueue_create_with_anchor(db, &cal_href, &uid, summary, None, due_opt)?;
         Ok(format!("Queued: create \"{summary}\" (#{op_id})"))

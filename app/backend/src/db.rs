@@ -570,6 +570,48 @@ pub fn enqueue_create_with_anchor(
     anchor: Option<&Anchor>,
     due: Option<&str>,
 ) -> Result<i64> {
+    enqueue_create_with_anchor_and_parent(
+        conn,
+        calendar_href,
+        uid,
+        summary,
+        anchor,
+        due,
+        None,
+    )
+}
+
+/// Queue a new task related to parent_uid using the standard iCalendar
+/// RELATED-TO;RELTYPE=PARENT property. The child still gets its own UID and is
+/// otherwise a normal VTODO, so CalDAV sync semantics remain unchanged.
+pub fn enqueue_create_subtask(
+    conn: &mut Connection,
+    calendar_href: &str,
+    uid: &str,
+    summary: &str,
+    parent_uid: &str,
+    due: Option<&str>,
+) -> Result<i64> {
+    enqueue_create_with_anchor_and_parent(
+        conn,
+        calendar_href,
+        uid,
+        summary,
+        None,
+        due,
+        Some(parent_uid),
+    )
+}
+
+fn enqueue_create_with_anchor_and_parent(
+    conn: &mut Connection,
+    calendar_href: &str,
+    uid: &str,
+    summary: &str,
+    anchor: Option<&Anchor>,
+    due: Option<&str>,
+    parent_uid: Option<&str>,
+) -> Result<i64> {
     let now_iso = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let escaped = crate::nextcloud::escape_ical_text(summary);
     // M16: an optional DUE line, rendered from the normalized due token. None /
@@ -579,6 +621,15 @@ pub fn enqueue_create_with_anchor(
     let due_line = due_token.and_then(crate::nextcloud::due_property_line);
     let cache_due: Option<&str> = if due_line.is_some() { due_token } else { None };
     let due_lines = due_line.map(|l| format!("{l}\r\n")).unwrap_or_default();
+    let parent_uid = parent_uid.map(str::trim).filter(|s| !s.is_empty());
+    let relation_lines = parent_uid
+        .map(|p| {
+            format!(
+                "RELATED-TO;RELTYPE=PARENT:{}\r\n",
+                crate::nextcloud::escape_ical_text(p)
+            )
+        })
+        .unwrap_or_default();
     // Machine anchors (doc/page) are controlled tokens written verbatim; only the
     // human label is escaped (a notebook name may contain commas/semicolons).
     let mut anchor_lines = String::new();
@@ -607,6 +658,7 @@ pub fn enqueue_create_with_anchor(
          LAST-MODIFIED:{now_iso}\r\n\
          SUMMARY:{escaped}\r\n\
          {due_lines}\
+         {relation_lines}\
          {anchor_lines}\
          STATUS:NEEDS-ACTION\r\n\
          END:VTODO\r\n\
@@ -743,6 +795,59 @@ pub fn enqueue_edit(
     Ok(op_id)
 }
 
+/// Queue a parent-relationship change for an existing task without changing
+/// its UID, summary, completion state, or due date. `parent_uid = None` makes
+/// the task top-level again.
+pub fn enqueue_set_parent(
+    conn: &mut Connection,
+    calendar_href: &str,
+    uid: &str,
+    parent_uid: Option<&str>,
+) -> Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+
+    let row: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT href, ical_text, COALESCE(summary, '') FROM task \
+             WHERE calendar_href = ?1 AND uid = ?2 AND pending_delete = 0",
+            params![calendar_href, uid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let (href, ical_text, summary) =
+        row.ok_or_else(|| anyhow::anyhow!("no live task with uid {uid}"))?;
+
+    let parent_uid = parent_uid.map(str::trim).filter(|s| !s.is_empty());
+    let new_ical = crate::nextcloud::set_parent_uid(&ical_text, parent_uid);
+
+    let affected = tx.execute(
+        "UPDATE task SET ical_text = ?1 \
+         WHERE calendar_href = ?2 AND href = ?3",
+        params![new_ical, calendar_href, href],
+    )?;
+    if affected != 1 {
+        return Err(anyhow::anyhow!(
+            "expected exactly 1 task row updated, got {affected}"
+        ));
+    }
+
+    // Reuse the normal edit queue type so the existing ETag/412 recovery path
+    // applies. Summary is included because edit dispatch requires it; the
+    // explicit parent_uid key tells retry logic to set/clear the relationship.
+    let payload = serde_json::to_string(&serde_json::json!({
+        "summary": summary,
+        "parent_uid": parent_uid.unwrap_or(""),
+    }))?;
+    tx.execute(
+        "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+         VALUES ('edit', ?1, ?2, ?3, ?4)",
+        params![uid, calendar_href, payload, unix_secs_now()],
+    )?;
+    let op_id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(op_id)
+}
+
 pub fn enqueue_delete(conn: &mut Connection, calendar_href: &str, uid: &str) -> Result<i64> {
     let tx = conn.unchecked_transaction()?;
 
@@ -780,6 +885,22 @@ pub fn create_local_with_anchor(
     due: Option<&str>,
 ) -> Result<()> {
     let op_id = enqueue_create_with_anchor(conn, LOCAL_LIST_ID, uid, summary, anchor, due)?;
+    finalize_local_create(conn, uid, op_id)
+}
+
+/// Local-list counterpart to enqueue_create_subtask.
+pub fn create_local_subtask(
+    conn: &mut Connection,
+    uid: &str,
+    summary: &str,
+    parent_uid: &str,
+    due: Option<&str>,
+) -> Result<()> {
+    let op_id = enqueue_create_subtask(conn, LOCAL_LIST_ID, uid, summary, parent_uid, due)?;
+    finalize_local_create(conn, uid, op_id)
+}
+
+fn finalize_local_create(conn: &mut Connection, uid: &str, op_id: i64) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
         "UPDATE task SET href = ?1 WHERE calendar_href = ?2 AND uid = ?3",
@@ -802,6 +923,15 @@ pub fn edit_local(
     due: Option<&str>,
 ) -> Result<()> {
     let op_id = enqueue_edit(conn, LOCAL_LIST_ID, uid, summary, due)?;
+    delete_pending_op(conn, op_id)
+}
+
+pub fn set_parent_local(
+    conn: &mut Connection,
+    uid: &str,
+    parent_uid: Option<&str>,
+) -> Result<()> {
+    let op_id = enqueue_set_parent(conn, LOCAL_LIST_ID, uid, parent_uid)?;
     delete_pending_op(conn, op_id)
 }
 
@@ -1300,6 +1430,27 @@ pub fn source_anchors(
     Ok(map)
 }
 
+/// Map of child task UID -> parent task UID. Relationships live in the VTODO's
+/// standard RELATED-TO property rather than a reTaskable-only database column,
+/// so a server round-trip remains the source of truth.
+pub fn parent_uids(conn: &Connection, calendar_href: &str) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT uid, ical_text FROM task \
+         WHERE calendar_href = ?1 AND pending_delete = 0",
+    )?;
+    let rows = stmt.query_map(params![calendar_href], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (uid, ical) = row?;
+        if let Some(parent_uid) = crate::nextcloud::extract_parent_uid(&ical) {
+            map.insert(uid, parent_uid);
+        }
+    }
+    Ok(map)
+}
+
 /// Clear all errored pending_op rows and reset their cache-side effects:
 /// - For errored Deletes, unset `pending_delete = 0` on the corresponding
 ///   task rows (so the row becomes live again and sync-collection can
@@ -1387,6 +1538,40 @@ mod tests {
             params![op_type, uid, cal, errored],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn enqueue_set_parent_updates_cache_and_payload_without_changing_uid() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:child-1\r\nSUMMARY:Existing\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task
+                (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('cal', 'https://example.test/child-1.ics', 'e1', ?1, 'Existing', 'needs-action', NULL, 'child-1', 0)",
+            params![ical],
+        )
+        .unwrap();
+
+        let op_id = enqueue_set_parent(&mut conn, "cal", "child-1", Some("parent-1")).unwrap();
+        assert!(op_id > 0);
+        let cached: String = conn
+            .query_row(
+                "SELECT ical_text FROM task WHERE calendar_href='cal' AND uid='child-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::nextcloud::extract_parent_uid(&cached).as_deref(),
+            Some("parent-1")
+        );
+        let payload: String = conn
+            .query_row("SELECT payload FROM pending_op WHERE id=?1", params![op_id], |r| r.get(0))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["parent_uid"], "parent-1");
+        assert_eq!(payload["summary"], "Existing");
     }
 
     #[test]
@@ -2111,6 +2296,43 @@ mod tests {
         assert_eq!(
             sources.get("uid-anch").map(String::as_str),
             Some("Q3 Planning, vol 2 · p.3")
+        );
+    }
+
+    #[test]
+    fn enqueue_create_subtask_writes_standard_parent_relation() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        conn.execute(
+            "INSERT INTO calendar (href, display_name) VALUES ('/cal/', 'Cal')",
+            [],
+        )
+        .unwrap();
+
+        enqueue_create_subtask(
+            &mut conn,
+            "/cal/",
+            "child-1",
+            "Pick up dry cleaning",
+            "parent-1",
+            None,
+        )
+        .unwrap();
+
+        let cached = get_cached_task_by_uid(&conn, "/cal/", "child-1")
+            .unwrap()
+            .expect("child cache row");
+        assert!(
+            cached
+                .ical_text
+                .contains("RELATED-TO;RELTYPE=PARENT:parent-1\r\n"),
+            "{}",
+            cached.ical_text
+        );
+        let parents = parent_uids(&conn, "/cal/").unwrap();
+        assert_eq!(
+            parents.get("child-1").map(String::as_str),
+            Some("parent-1")
         );
     }
 
