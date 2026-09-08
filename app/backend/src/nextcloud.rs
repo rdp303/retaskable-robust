@@ -2198,6 +2198,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             0,
         );
@@ -2230,6 +2231,7 @@ mod tests {
             &marks,
             &HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
             Some("Last synced 5 minutes ago."),
             0,
         );
@@ -2254,7 +2256,15 @@ mod tests {
         let tasks = vec![task("uid-A", "Buy milk")];
         let mut marks = HashMap::new();
         marks.insert("uid-A".to_string(), true);
-        let out = format_tasks_json(&tasks, &marks, &HashMap::new(), &HashMap::new(), None, 3);
+        let out = format_tasks_json(
+            &tasks,
+            &marks,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            3,
+        );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["tasks"][0]["mark"], "!");
         assert_eq!(v["conflicts"], 3);
@@ -2270,7 +2280,15 @@ mod tests {
             "uid-A".to_string(),
             ("doc-uuid-123".to_string(), "idx:2".to_string()),
         );
-        let out = format_tasks_json(&tasks, &HashMap::new(), &sources, &anchors, None, 0);
+        let out = format_tasks_json(
+            &tasks,
+            &HashMap::new(),
+            &sources,
+            &anchors,
+            &HashMap::new(),
+            None,
+            0,
+        );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let arr = v["tasks"].as_array().unwrap();
         // uid-A and uid-B both open + undated, so href tiebreak keeps input order.
@@ -2282,6 +2300,24 @@ mod tests {
         assert_eq!(arr[1]["source"], ""); // absent -> empty string, never null
         assert_eq!(arr[1]["doc"], ""); // absent anchor -> empty strings, never null
         assert_eq!(arr[1]["page"], "");
+    }
+
+    #[test]
+    fn format_tasks_json_carries_parent_uid() {
+        let tasks = vec![task("child-1", "Call contractor")];
+        let mut parents = HashMap::new();
+        parents.insert("child-1".to_string(), "parent-1".to_string());
+        let out = format_tasks_json(
+            &tasks,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &parents,
+            None,
+            0,
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["tasks"][0]["parent_uid"], "parent-1");
     }
 
     #[test]
