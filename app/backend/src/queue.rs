@@ -405,8 +405,10 @@ fn fetch_cached_for_dispatch(
 ) -> Result<Option<(String, String, String)>> {
     let row: Option<(String, String, String)> = conn
         .query_row(
-            "SELECT href, etag, ical_text FROM task \
-             WHERE calendar_href = ?1 AND uid = ?2",
+            "SELECT href, etag, ical_text FROM task
+             WHERE calendar_href = ?1 AND uid = ?2
+             ORDER BY CASE WHEN href LIKE 'pending:%' THEN 1 ELSE 0 END, href
+             LIMIT 1",
             rusqlite::params![calendar_href, uid],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -415,6 +417,13 @@ fn fetch_cached_for_dispatch(
 }
 
 pub fn build_task_url(calendar_url: &Url, href: &str) -> Result<Url> {
+    // pending:<uid> is a local sentinel, never a network location. Reject it
+    // explicitly so a damaged/legacy cache cannot turn a local state marker
+    // into an HTTP request.
+    if href.starts_with("pending:") || href.starts_with("local:") {
+        anyhow::bail!("local task href cannot be used for CalDAV HTTP: {href}");
+    }
+
     // href in the cache is whatever sync-collection stored. nextcloud::sync_collection
     // canonicalises to absolute URL strings via base.join().to_string(); CalDAV servers
     // also legally emit absolute-path hrefs. Url::parse handles the former; base.join

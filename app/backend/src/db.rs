@@ -398,19 +398,83 @@ pub fn upsert_task(
     uid: &str,
     parsed: &Task,
 ) -> Result<()> {
+    let uid = uid.trim();
+    if uid.is_empty() {
+        anyhow::bail!("refusing to cache VTODO with empty UID");
+    }
+
     let status = status_to_str(parsed.status);
-    conn.execute(
-        "INSERT INTO task (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
-         ON CONFLICT(calendar_href, href) DO UPDATE SET
-            etag = excluded.etag,
-            ical_text = excluded.ical_text,
-            summary = excluded.summary,
-            status = excluded.status,
-            due = excluded.due,
-            uid = excluded.uid",
-        params![calendar_href, task_href, etag, ical_text, parsed.summary, status, parsed.due, uid],
-    )?;
+    let tx = conn.unchecked_transaction()?;
+
+    // UID is the logical identity of a VTODO. A locally-created task starts
+    // life at pending:<uid>; when the server later returns its real href we
+    // must reconcile that row rather than insert a second representation.
+    // This also repairs legacy databases that already contain both rows.
+    let existing_hrefs: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT href FROM task WHERE calendar_href = ?1 AND uid = ?2
+             ORDER BY CASE WHEN href = ?3 THEN 0 WHEN href LIKE 'pending:%' THEN 1 ELSE 2 END, href",
+        )?;
+        let rows = stmt.query_map(params![calendar_href, uid, task_href], |r| {
+            r.get::<_, String>(0)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    if existing_hrefs.is_empty() {
+        tx.execute(
+            "INSERT INTO task
+                (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)",
+            params![
+                calendar_href,
+                task_href,
+                etag,
+                ical_text,
+                parsed.summary,
+                status,
+                parsed.due,
+                uid
+            ],
+        )?;
+    } else {
+        let canonical_href = existing_hrefs[0].as_str();
+
+        // Remove every duplicate representation except the row we are about to
+        // update. If the canonical row is pending:<uid>, changing its href below
+        // promotes that exact local row to the server resource.
+        tx.execute(
+            "DELETE FROM task
+              WHERE calendar_href = ?1 AND uid = ?2 AND href <> ?3",
+            params![calendar_href, uid, canonical_href],
+        )?;
+
+        tx.execute(
+            "UPDATE task
+                SET href = ?1,
+                    etag = ?2,
+                    ical_text = ?3,
+                    summary = ?4,
+                    status = ?5,
+                    due = ?6,
+                    uid = ?7,
+                    pending_delete = 0
+              WHERE calendar_href = ?8 AND href = ?9",
+            params![
+                task_href,
+                etag,
+                ical_text,
+                parsed.summary,
+                status,
+                parsed.due,
+                uid,
+                calendar_href,
+                canonical_href
+            ],
+        )?;
+    }
+
+    tx.commit()?;
     Ok(())
 }
 
@@ -1323,6 +1387,52 @@ mod tests {
             params![op_type, uid, cal, errored],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn server_upsert_reconciles_pending_row_by_uid_without_duplicate() {
+        let conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+
+        let uid = "same-uid";
+        let pending_href = "pending:same-uid";
+        let server_href = "https://example.test/cal/same-uid.ics";
+        let pending_ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:same-uid\r\nSUMMARY:Local\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task
+                (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('cal', ?1, '', ?2, 'Local', 'needs-action', NULL, ?3, 0)",
+            params![pending_href, pending_ical, uid],
+        )
+        .unwrap();
+
+        let parsed = Task {
+            uid: uid.to_string(),
+            summary: "Server".to_string(),
+            status: TaskStatus::NeedsAction,
+            due: None,
+        };
+        let server_ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:same-uid\r\nSUMMARY:Server\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        upsert_task(
+            &conn,
+            "cal",
+            server_href,
+            "\"etag-1\"",
+            server_ical,
+            uid,
+            &parsed,
+        )
+        .unwrap();
+
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT href, summary FROM task WHERE calendar_href = 'cal' AND uid = ?1")
+            .unwrap()
+            .query_map(params![uid], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(rows, vec![(server_href.to_string(), "Server".to_string())]);
     }
 
     #[test]

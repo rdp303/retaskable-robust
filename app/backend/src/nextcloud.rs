@@ -1298,7 +1298,14 @@ fn parse_vtodos(ical_text: &str) -> Result<Vec<Task>> {
         let CalendarComponent::Todo(todo) = component else {
             continue;
         };
-        let uid = todo.property_value("UID").unwrap_or("").to_string();
+        let uid = todo.property_value("UID").unwrap_or("").trim().to_string();
+        if uid.is_empty() {
+            // A VTODO without a UID cannot be addressed safely for edits,
+            // toggles, deletes, or reconciliation. Skip only this malformed
+            // component so one bad server item cannot poison the whole sync.
+            eprintln!("retaskable: skipping VTODO with missing/empty UID");
+            continue;
+        }
         let summary = todo
             .property_value("SUMMARY")
             .unwrap_or("(no summary)")
@@ -1561,7 +1568,7 @@ mod tests {
         discover_calendars, due_property_line, ensure_crlf, escape_ical_text, extract_source_doc,
         extract_source_label, extract_source_page, filter_for_display, format_tasks_json, get_task,
         is_icloud_caldav_host, parse_sync_response, redirect_allowed, replace_summary, set_due,
-        sync_collection_unsupported, unescape_ical_text,
+        sync_collection_unsupported, unescape_ical_text, parse_vtodos,
     };
     use crate::config::NextcloudConfig;
 
@@ -1576,6 +1583,25 @@ mod tests {
         STATUS:NEEDS-ACTION\r\n\
         END:VTODO\r\n\
         END:VCALENDAR\r\n";
+
+    #[test]
+    fn parse_vtodos_skips_missing_uid_but_keeps_valid_siblings() {
+        let input = "BEGIN:VCALENDAR\r\n\
+            VERSION:2.0\r\n\
+            BEGIN:VTODO\r\n\
+            SUMMARY:Malformed\r\n\
+            END:VTODO\r\n\
+            BEGIN:VTODO\r\n\
+            UID:good-uid\r\n\
+            SUMMARY:Valid\r\n\
+            STATUS:NEEDS-ACTION\r\n\
+            END:VTODO\r\n\
+            END:VCALENDAR\r\n";
+        let tasks = parse_vtodos(input).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].uid, "good-uid");
+        assert_eq!(tasks[0].summary, "Valid");
+    }
 
     #[test]
     fn due_property_line_renders_each_form() {

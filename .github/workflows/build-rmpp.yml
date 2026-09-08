@@ -1,0 +1,49 @@
+name: Build reMarkable Paper Pro
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - robust-sync-v1
+    paths:
+      - "app/**"
+      - ".github/workflows/build-rmpp.yml"
+
+jobs:
+  build-rmpp:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/toltec-dev/rust:v4.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt rcc
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends qt6-base-dev
+          ln -sf /usr/lib/qt6/libexec/rcc /usr/local/bin/rcc
+
+      - name: Build aarch64 package
+        shell: bash
+        run: |
+          rustup default stable
+          rustup target add aarch64-unknown-linux-gnu
+          . /opt/x-tools/switch-aarch64.sh
+          cd app
+          ./build-rmpp.sh
+
+      - name: Verify output
+        run: |
+          test -x app/output-rmpp/backend/entry
+          test -f app/output-rmpp/resources.rcc
+          test -f app/output-rmpp/manifest.json
+          test -f app/output-rmpp/icon.png
+          find app/output-rmpp -maxdepth 2 -type f -print
+
+      - name: Upload reTaskable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: retaskable-robust-rmpp
+          path: app/output-rmpp/
+          if-no-files-found: error
+          retention-days: 14
