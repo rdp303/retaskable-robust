@@ -1264,6 +1264,50 @@ fn extract_xprop(ical_text: &str, prefix: &str) -> Option<String> {
     None
 }
 
+/// Return the parent task UID from a standard RFC 5545 RELATED-TO property.
+///
+/// reTaskable writes subtasks as:
+/// `RELATED-TO;RELTYPE=PARENT:<parent uid>`.
+/// RFC 5545 defines PARENT as the default RELTYPE, so we also accept a bare
+/// `RELATED-TO:<uid>`. CHILD/SIBLING relationships are intentionally ignored.
+/// The relation is read from the cached raw iCalendar body so no database schema
+/// change is required for subtask v1.
+pub fn extract_parent_uid(ical_text: &str) -> Option<String> {
+    let unfolded = unfold_ical(ical_text);
+    for line in unfolded.lines() {
+        let line = line.trim_end_matches('\r');
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
+        let head = &line[..colon];
+        let mut parts = head.split(';');
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("RELATED-TO") {
+            continue;
+        }
+
+        let mut reltype: Option<&str> = None;
+        for param in parts {
+            if let Some((key, value)) = param.split_once('=') {
+                if key.eq_ignore_ascii_case("RELTYPE") {
+                    reltype = Some(value.trim_matches('"'));
+                }
+            }
+        }
+        if reltype.is_some_and(|v| !v.eq_ignore_ascii_case("PARENT")) {
+            continue;
+        }
+
+        let value = unescape_ical_text(line[colon + 1..].trim());
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
 fn matching_mutation<'a>(
     line: &str,
     mutations: &'a [(&'a str, Option<String>)],
@@ -1408,6 +1452,7 @@ pub fn format_tasks_json(
     marks: &HashMap<String, bool>,
     sources: &HashMap<String, String>,
     anchors: &HashMap<String, (String, String)>,
+    parents: &HashMap<String, String>,
     last_synced: Option<&str>,
     conflicts: i64,
 ) -> String {
@@ -1435,6 +1480,9 @@ pub fn format_tasks_json(
                 "due": t.due,
                 "mark": mark,
                 "source": sources.get(&t.uid).cloned().unwrap_or_default(),
+                // Subtask v1: empty for top-level tasks, otherwise the UID of
+                // the task referenced by RELATED-TO;RELTYPE=PARENT.
+                "parent_uid": parents.get(&t.uid).cloned().unwrap_or_default(),
                 // M15 machine anchor for jump-back: doc UUID + page key ("idx:N").
                 // Empty strings when absent (never null) so QML keys off length.
                 "doc": doc,
@@ -2279,6 +2327,26 @@ mod tests {
         assert_eq!(extract_source_label(ical), None);
         assert_eq!(extract_source_doc(ical), None);
         assert_eq!(extract_source_page(ical), None);
+    }
+
+    #[test]
+    fn extract_parent_uid_reads_explicit_parent_relation() {
+        let ical = "BEGIN:VTODO\r\nUID:child-1\r\nRELATED-TO;RELTYPE=PARENT:parent-1\r\nEND:VTODO\r\n";
+        assert_eq!(extract_parent_uid(ical).as_deref(), Some("parent-1"));
+    }
+
+    #[test]
+    fn extract_parent_uid_accepts_default_parent_and_ignores_child_relation() {
+        let default_parent =
+            "BEGIN:VTODO\r\nUID:child-1\r\nRELATED-TO:parent-1\r\nEND:VTODO\r\n";
+        assert_eq!(
+            extract_parent_uid(default_parent).as_deref(),
+            Some("parent-1")
+        );
+
+        let child_relation =
+            "BEGIN:VTODO\r\nUID:parent-1\r\nRELATED-TO;RELTYPE=CHILD:child-1\r\nEND:VTODO\r\n";
+        assert_eq!(extract_parent_uid(child_relation), None);
     }
 
     fn task_with_status(uid: &str, status: TaskStatus) -> Task {
