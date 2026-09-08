@@ -1613,8 +1613,9 @@ fn propstat_is_ok(propstat: &roxmltree::Node) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_calendars, due_property_line, ensure_crlf, escape_ical_text, extract_source_doc,
-        extract_source_label, extract_source_page, filter_for_display, format_tasks_json, get_task,
+        discover_calendars, due_property_line, ensure_crlf, escape_ical_text, extract_parent_uid,
+        extract_source_doc, extract_source_label, extract_source_page, filter_for_display,
+        format_tasks_json, get_task,
         is_icloud_caldav_host, parse_sync_response, redirect_allowed, replace_summary, set_due,
         sync_collection_unsupported, unescape_ical_text, parse_vtodos,
     };
