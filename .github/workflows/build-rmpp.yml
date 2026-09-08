@@ -26,6 +26,8 @@ jobs:
       - name: Build aarch64 package
         shell: bash
         run: |
+          rustup default stable
+          rustup target add aarch64-unknown-linux-gnu
           . /opt/x-tools/switch-aarch64.sh
           cd app
           ./build-rmpp.sh
