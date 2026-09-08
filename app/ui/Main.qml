@@ -42,6 +42,8 @@ Rectangle {
     property string detailDueOriginal: ""
     property string detailSource: ""
     property string detailMark: ""
+    // Subtask v1: empty for a top-level task; otherwise the parent task UID.
+    property string detailParentUid: ""
     // M15 jump-back: the source note's machine anchor for the open task.
     property string detailDoc: ""
     property string detailPage: ""
@@ -444,8 +446,9 @@ Rectangle {
         taskModel.clear()
         root.createReady = true
         var tasks = data.tasks || []
-        for (var i = 0; i < tasks.length; i++) {
-            var t = tasks[i]
+        var appended = {}
+
+        function appendTask(t) {
             taskModel.append({
                 uid: t.uid,
                 summary: t.summary,
@@ -453,11 +456,32 @@ Rectangle {
                 due: t.due ? t.due : "",
                 mark: t.mark ? t.mark : "",
                 source: t.source ? t.source : "",
+                parent_uid: t.parent_uid ? t.parent_uid : "",
                 // M15 machine anchor for jump-back (empty when not note-captured).
                 doc: t.doc ? t.doc : "",
                 page: t.page ? t.page : ""
             })
+            appended[t.uid] = true
         }
+
+        // Keep direct children immediately beneath their parent. If the parent
+        // is filtered out (for example, completed while the child is still open),
+        // the final pass still renders the child instead of hiding it.
+        for (var i = 0; i < tasks.length; i++) {
+            var parent = tasks[i]
+            if (parent.parent_uid && parent.parent_uid.length > 0) continue
+            appendTask(parent)
+            for (var j = 0; j < tasks.length; j++) {
+                var child = tasks[j]
+                if (child.parent_uid === parent.uid && !appended[child.uid]) {
+                    appendTask(child)
+                }
+            }
+        }
+        for (var k = 0; k < tasks.length; k++) {
+            if (!appended[tasks[k].uid]) appendTask(tasks[k])
+        }
+
         root.conflictCount = data.conflicts ? data.conflicts : 0
         taskList.contentY = 0
         var synced = data.last_synced ? data.last_synced : "Not yet synced — tap Sync."
@@ -495,6 +519,7 @@ Rectangle {
         root.detailDue = t.due ? t.due : ""
         root.detailSource = t.source ? t.source : ""
         root.detailMark = t.mark ? t.mark : ""
+        root.detailParentUid = t.parent_uid ? t.parent_uid : ""
         root.detailDoc = t.doc ? t.doc : ""
         root.detailPage = t.page ? t.page : ""
         root.detailDeleteArmed = false
@@ -511,6 +536,8 @@ Rectangle {
     // else takes it down on the way back to the list).
     function closeDetail() {
         detailSummaryInput.focus = false
+        subtaskInput.focus = false
+        subtaskInput.text = ""
         Qt.inputMethod.hide()
         root.detailOpen = false
     }
@@ -717,7 +744,8 @@ Rectangle {
                             // the normalized token ("" when no date was set).
                             endpoint.sendMessage(8, JSON.stringify({
                                 summary: summaryInput.text.trim(),
-                                due: createDue.token
+                                due: createDue.token,
+                                parent_uid: ""
                             }))
                             summaryInput.text = ""
                             createDue.clearDue()
@@ -958,7 +986,7 @@ Rectangle {
 
             Row {
                 anchors.fill: parent
-                anchors.leftMargin: 8
+                anchors.leftMargin: (model.parent_uid && model.parent_uid.length > 0) ? 44 : 8
                 anchors.rightMargin: 8
                 spacing: 14
 
@@ -1590,6 +1618,129 @@ Rectangle {
                 font.family: "monospace"
                 elide: Text.ElideRight
                 color: "#555555"
+            }
+
+            Text {
+                visible: root.detailParentUid.length > 0
+                text: "Subtask"
+                font.pixelSize: 22
+                font.bold: true
+                color: "#333333"
+            }
+
+            // Subtask v1: one level of child VTODOs. Children remain ordinary
+            // synced tasks and are related to this parent via RELATED-TO.
+            Text {
+                visible: root.detailParentUid.length === 0
+                text: "Subtasks"
+                font.pixelSize: 26
+                font.bold: true
+                color: "black"
+            }
+
+            Repeater {
+                model: taskModel
+
+                delegate: Rectangle {
+                    property bool belongsHere: root.detailParentUid.length === 0
+                                               && model.parent_uid === root.detailUid
+                    visible: belongsHere
+                    width: detailColumn.width
+                    height: belongsHere ? 64 : 0
+                    color: "white"
+
+                    Row {
+                        anchors.fill: parent
+                        spacing: 12
+
+                        CheckBox {
+                            id: subtaskCheck
+                            anchors.verticalCenter: parent.verticalCenter
+                            checked: model.completed
+                            onToggled: endpoint.sendMessage(14, model.uid)
+                            implicitWidth: 56
+                            implicitHeight: 56
+                            padding: 0
+
+                            indicator: Rectangle {
+                                anchors.centerIn: parent
+                                width: 42
+                                height: 42
+                                radius: 4
+                                color: "white"
+                                border.color: "black"
+                                border.width: 3
+
+                                Rectangle {
+                                    anchors.centerIn: parent
+                                    visible: subtaskCheck.checked
+                                    width: 24
+                                    height: 24
+                                    radius: 2
+                                    color: "black"
+                                }
+                            }
+                        }
+
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: parent.width - subtaskCheck.width - 20
+                            text: model.summary
+                            font.pixelSize: 24
+                            elide: Text.ElideRight
+                            color: model.completed ? "#606060" : "black"
+                            font.strikeout: model.completed
+                        }
+                    }
+                }
+            }
+
+            Row {
+                visible: root.detailParentUid.length === 0
+                width: parent.width
+                spacing: 16
+
+                TextField {
+                    id: subtaskInput
+                    width: parent.width - addSubtaskBtn.width - 16
+                    height: 68
+                    font.pixelSize: 24
+                    color: "black"
+                    placeholderTextColor: "#303030"
+                    placeholderText: "New subtask"
+                }
+
+                Rectangle {
+                    id: addSubtaskBtn
+                    property bool active: subtaskInput.text.trim().length > 0 && root.createReady
+                    width: 160
+                    height: 68
+                    color: addSubtaskBtn.active ? "white" : "#dddddd"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Add"
+                        font.pixelSize: 23
+                        color: addSubtaskBtn.active ? "black" : "#555555"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        enabled: addSubtaskBtn.active
+                        onClicked: {
+                            endpoint.sendMessage(8, JSON.stringify({
+                                summary: subtaskInput.text.trim(),
+                                due: "",
+                                parent_uid: root.detailUid
+                            }))
+                            subtaskInput.text = ""
+                            subtaskInput.focus = false
+                            Qt.inputMethod.hide()
+                        }
+                    }
+                }
             }
 
             // Edit: a wrapping editable field shows the full summary AND edits it.
