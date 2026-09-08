@@ -795,6 +795,59 @@ pub fn enqueue_edit(
     Ok(op_id)
 }
 
+/// Queue a parent-relationship change for an existing task without changing
+/// its UID, summary, completion state, or due date. `parent_uid = None` makes
+/// the task top-level again.
+pub fn enqueue_set_parent(
+    conn: &mut Connection,
+    calendar_href: &str,
+    uid: &str,
+    parent_uid: Option<&str>,
+) -> Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+
+    let row: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT href, ical_text, COALESCE(summary, '') FROM task \
+             WHERE calendar_href = ?1 AND uid = ?2 AND pending_delete = 0",
+            params![calendar_href, uid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let (href, ical_text, summary) =
+        row.ok_or_else(|| anyhow::anyhow!("no live task with uid {uid}"))?;
+
+    let parent_uid = parent_uid.map(str::trim).filter(|s| !s.is_empty());
+    let new_ical = crate::nextcloud::set_parent_uid(&ical_text, parent_uid);
+
+    let affected = tx.execute(
+        "UPDATE task SET ical_text = ?1 \
+         WHERE calendar_href = ?2 AND href = ?3",
+        params![new_ical, calendar_href, href],
+    )?;
+    if affected != 1 {
+        return Err(anyhow::anyhow!(
+            "expected exactly 1 task row updated, got {affected}"
+        ));
+    }
+
+    // Reuse the normal edit queue type so the existing ETag/412 recovery path
+    // applies. Summary is included because edit dispatch requires it; the
+    // explicit parent_uid key tells retry logic to set/clear the relationship.
+    let payload = serde_json::to_string(&serde_json::json!({
+        "summary": summary,
+        "parent_uid": parent_uid.unwrap_or(""),
+    }))?;
+    tx.execute(
+        "INSERT INTO pending_op (op_type, target_uid, target_calendar_href, payload, enqueued_at)
+         VALUES ('edit', ?1, ?2, ?3, ?4)",
+        params![uid, calendar_href, payload, unix_secs_now()],
+    )?;
+    let op_id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(op_id)
+}
+
 pub fn enqueue_delete(conn: &mut Connection, calendar_href: &str, uid: &str) -> Result<i64> {
     let tx = conn.unchecked_transaction()?;
 
@@ -870,6 +923,15 @@ pub fn edit_local(
     due: Option<&str>,
 ) -> Result<()> {
     let op_id = enqueue_edit(conn, LOCAL_LIST_ID, uid, summary, due)?;
+    delete_pending_op(conn, op_id)
+}
+
+pub fn set_parent_local(
+    conn: &mut Connection,
+    uid: &str,
+    parent_uid: Option<&str>,
+) -> Result<()> {
+    let op_id = enqueue_set_parent(conn, LOCAL_LIST_ID, uid, parent_uid)?;
     delete_pending_op(conn, op_id)
 }
 
@@ -1476,6 +1538,40 @@ mod tests {
             params![op_type, uid, cal, errored],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn enqueue_set_parent_updates_cache_and_payload_without_changing_uid() {
+        let mut conn = fresh();
+        ensure_schema_v2(&conn).expect("migrate");
+        let ical = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:child-1\r\nSUMMARY:Existing\r\nSTATUS:NEEDS-ACTION\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        conn.execute(
+            "INSERT INTO task
+                (calendar_href, href, etag, ical_text, summary, status, due, uid, pending_delete)
+             VALUES ('cal', 'https://example.test/child-1.ics', 'e1', ?1, 'Existing', 'needs-action', NULL, 'child-1', 0)",
+            params![ical],
+        )
+        .unwrap();
+
+        let op_id = enqueue_set_parent(&mut conn, "cal", "child-1", Some("parent-1")).unwrap();
+        assert!(op_id > 0);
+        let cached: String = conn
+            .query_row(
+                "SELECT ical_text FROM task WHERE calendar_href='cal' AND uid='child-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::nextcloud::extract_parent_uid(&cached).as_deref(),
+            Some("parent-1")
+        );
+        let payload: String = conn
+            .query_row("SELECT payload FROM pending_op WHERE id=?1", params![op_id], |r| r.get(0))
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(payload["parent_uid"], "parent-1");
+        assert_eq!(payload["summary"], "Existing");
     }
 
     #[test]
