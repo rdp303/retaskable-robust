@@ -44,6 +44,8 @@ Rectangle {
     property string detailMark: ""
     // Subtask v1: empty for a top-level task; otherwise the parent task UID.
     property string detailParentUid: ""
+    // Existing-task parenting picker.
+    property bool parentPickerOpen: false
     // M15 jump-back: the source note's machine anchor for the open task.
     property string detailDoc: ""
     property string detailPage: ""
@@ -72,6 +74,11 @@ Rectangle {
     // envelope MSG 104 carries. Each row: { uid, summary, completed, due, mark }.
     ListModel {
         id: taskModel
+    }
+
+    // Eligible top-level tasks shown when converting an existing task to a subtask.
+    ListModel {
+        id: parentCandidateModel
     }
 
     // M11: calendars discovered for the Settings picker.
@@ -121,7 +128,7 @@ Rectangle {
                 root.applyToggleResult(contents)
                 return
             }
-            if (type === 105 || type === 108 || type === 119 || type === 120) {
+            if (type === 105 || type === 108 || type === 119 || type === 120 || type === 126) {
                 statusText.text = contents
                 root.refreshList()
                 return
@@ -509,6 +516,36 @@ Rectangle {
         }
     }
 
+    function taskHasChildren(uid) {
+        for (var i = 0; i < taskModel.count; i++) {
+            if (taskModel.get(i).parent_uid === uid) return true
+        }
+        return false
+    }
+
+    function taskSummaryByUid(uid) {
+        for (var i = 0; i < taskModel.count; i++) {
+            var task = taskModel.get(i)
+            if (task.uid === uid) return task.summary
+        }
+        return uid
+    }
+
+    function openParentPicker() {
+        parentCandidateModel.clear()
+        for (var i = 0; i < taskModel.count; i++) {
+            var task = taskModel.get(i)
+            if (task.uid === root.detailUid) continue
+            if (task.completed === true) continue
+            if (task.parent_uid && task.parent_uid.length > 0) continue
+            parentCandidateModel.append({
+                uid: task.uid,
+                summary: task.summary
+            })
+        }
+        root.parentPickerOpen = true
+    }
+
     // Open the task-detail dialog for the row at `idx`, copying its fields out
     // of the model (the dialog reads root.detail* so it survives a list refresh).
     function openDetail(idx) {
@@ -539,6 +576,7 @@ Rectangle {
         subtaskInput.focus = false
         subtaskInput.text = ""
         Qt.inputMethod.hide()
+        root.parentPickerOpen = false
         root.detailOpen = false
     }
 
@@ -1622,10 +1660,94 @@ Rectangle {
 
             Text {
                 visible: root.detailParentUid.length > 0
-                text: "Subtask"
+                text: "Subtask of: " + root.taskSummaryByUid(root.detailParentUid)
                 font.pixelSize: 22
                 font.bold: true
                 color: "#333333"
+            }
+
+            Row {
+                spacing: 16
+
+                Rectangle {
+                    visible: root.detailParentUid.length === 0
+                             && !root.taskHasChildren(root.detailUid)
+                    width: 240
+                    height: 68
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Make Subtask"
+                        font.pixelSize: 22
+                        color: "black"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: root.openParentPicker()
+                    }
+                }
+
+                Rectangle {
+                    visible: root.detailParentUid.length > 0
+                    width: 240
+                    height: 68
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Change Parent"
+                        font.pixelSize: 22
+                        color: "black"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: root.openParentPicker()
+                    }
+                }
+
+                Rectangle {
+                    visible: root.detailParentUid.length > 0
+                    width: 240
+                    height: 68
+                    color: "white"
+                    border.color: "black"
+                    border.width: 3
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "Make Top Level"
+                        font.pixelSize: 21
+                        color: "black"
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            endpoint.sendMessage(26, JSON.stringify({
+                                uid: root.detailUid,
+                                parent_uid: ""
+                            }))
+                            root.closeDetail()
+                        }
+                    }
+                }
+            }
+
+            Text {
+                visible: root.detailParentUid.length === 0
+                         && root.taskHasChildren(root.detailUid)
+                width: parent.width
+                text: "This task already has subtasks, so it stays top-level in v1."
+                wrapMode: Text.Wrap
+                font.pixelSize: 20
+                color: "#555555"
             }
 
             // Subtask v1: one level of child VTODOs. Children remain ordinary
@@ -1967,6 +2089,105 @@ Rectangle {
             MouseArea {
                 anchors.fill: parent
                 onClicked: root.closeDetail()
+            }
+        }
+    }
+
+    // Existing-task parent picker. Only top-level, open tasks are eligible
+    // parents, preserving subtasks-v1's one-level hierarchy.
+    Rectangle {
+        id: parentPickerOverlay
+        anchors.fill: parent
+        color: "white"
+        visible: root.parentPickerOpen
+        z: 220
+
+        Text {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.topMargin: 40
+            anchors.leftMargin: 40
+            text: "Choose Parent Task"
+            font.pixelSize: 32
+            font.bold: true
+            color: "black"
+        }
+
+        Rectangle {
+            anchors.top: parent.top
+            anchors.right: parent.right
+            anchors.topMargin: 40
+            anchors.rightMargin: 40
+            width: 220
+            height: 68
+            color: "white"
+            border.color: "black"
+            border.width: 3
+
+            Text {
+                anchors.centerIn: parent
+                text: "Cancel"
+                font.pixelSize: 22
+                color: "black"
+            }
+
+            MouseArea {
+                anchors.fill: parent
+                onClicked: root.parentPickerOpen = false
+            }
+        }
+
+        ListView {
+            anchors.top: parent.top
+            anchors.topMargin: 130
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.margins: 40
+            clip: true
+            model: parentCandidateModel
+            spacing: 8
+
+            delegate: Rectangle {
+                width: ListView.view.width
+                height: 76
+                color: "white"
+                border.color: "black"
+                border.width: 2
+
+                Text {
+                    anchors.left: parent.left
+                    anchors.leftMargin: 18
+                    anchors.right: parent.right
+                    anchors.rightMargin: 18
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: model.summary
+                    font.pixelSize: 24
+                    elide: Text.ElideRight
+                    color: "black"
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {
+                        endpoint.sendMessage(26, JSON.stringify({
+                            uid: root.detailUid,
+                            parent_uid: model.uid
+                        }))
+                        root.closeDetail()
+                    }
+                }
+            }
+
+            Text {
+                anchors.centerIn: parent
+                visible: parentCandidateModel.count === 0
+                width: parent.width - 80
+                text: "No other open top-level tasks are available as a parent."
+                wrapMode: Text.Wrap
+                horizontalAlignment: Text.AlignHCenter
+                font.pixelSize: 24
+                color: "#444444"
             }
         }
     }
