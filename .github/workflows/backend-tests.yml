@@ -3,7 +3,7 @@ name: Backend tests
 on:
   push:
     branches:
-      - robust-sync-v1
+      - "**"
   pull_request:
     paths:
       - "app/backend/**"
