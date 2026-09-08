@@ -1327,23 +1327,21 @@ pub fn set_parent_uid(ical_text: &str, parent_uid: Option<&str>) -> String {
 
         // Remove an existing PARENT relationship (including bare RELATED-TO,
         // whose default RELTYPE is PARENT). Leave CHILD/SIBLING relations alone.
-        if line.len() >= 10 && line[..10].eq_ignore_ascii_case("RELATED-TO") {
-            if let Some(colon) = line.find(':') {
-                let head = &line[..colon];
-                let mut parts = head.split(';');
-                let name = parts.next().unwrap_or("");
-                if name.eq_ignore_ascii_case("RELATED-TO") {
-                    let mut reltype: Option<&str> = None;
-                    for param in parts {
-                        if let Some((key, value)) = param.split_once('=') {
-                            if key.eq_ignore_ascii_case("RELTYPE") {
-                                reltype = Some(value.trim_matches('"'));
-                            }
+        if let Some(colon) = line.find(':') {
+            let head = &line[..colon];
+            let mut parts = head.split(';');
+            let name = parts.next().unwrap_or("");
+            if name.eq_ignore_ascii_case("RELATED-TO") {
+                let mut reltype: Option<&str> = None;
+                for param in parts {
+                    if let Some((key, value)) = param.split_once('=') {
+                        if key.eq_ignore_ascii_case("RELTYPE") {
+                            reltype = Some(value.trim_matches('"'));
                         }
                     }
-                    if reltype.is_none() || reltype.is_some_and(|v| v.eq_ignore_ascii_case("PARENT")) {
-                        continue;
-                    }
+                }
+                if reltype.is_none() || reltype.is_some_and(|v| v.eq_ignore_ascii_case("PARENT")) {
+                    continue;
                 }
             }
         }
