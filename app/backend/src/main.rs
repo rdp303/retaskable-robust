@@ -495,6 +495,7 @@ fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<St
     let marks = db::pending_marks(db, &cal_href)?;
     let sources = db::source_labels(db, &cal_href)?;
     let anchors = db::source_anchors(db, &cal_href)?;
+    let parents = db::parent_uids(db, &cal_href)?;
     let last_synced = if db::is_local_list(&cal_href) {
         Some("Stored on this reMarkable.".to_string())
     } else {
@@ -506,6 +507,7 @@ fn show_tasks(db: &mut Connection, include_completed: bool) -> anyhow::Result<St
         &marks,
         &sources,
         &anchors,
+        &parents,
         last_synced.as_deref(),
         conflicts,
     ))
@@ -2287,38 +2289,70 @@ async fn discover_with_inner(payload: &str) -> anyhow::Result<Vec<nextcloud::Cal
 }
 
 fn create(db: &mut Connection, payload: &str) -> anyhow::Result<String> {
-    // M16: payload is JSON `{summary, due}`. Fall back to treating the whole
-    // payload as a bare summary (no due) so a pre-M16 plain-string sender still
-    // works. `due` is the normalized token ("" / YYYYMMDD / YYYYMMDDTHHMMSS).
-    let (summary_owned, due_owned) = match serde_json::from_str::<serde_json::Value>(payload) {
-        Ok(v) if v.is_object() => {
-            let s = v
-                .get("summary")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            let d = v
-                .get("due")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string();
-            (s, d)
-        }
-        _ => (payload.to_string(), String::new()),
-    };
+    // Subtask v1 extends the M16 JSON payload to {summary, due, parent_uid}.
+    // Bare-string senders remain supported and create top-level tasks.
+    let (summary_owned, due_owned, parent_uid_owned) =
+        match serde_json::from_str::<serde_json::Value>(payload) {
+            Ok(v) if v.is_object() => {
+                let s = v
+                    .get("summary")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let d = v
+                    .get("due")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let p = v
+                    .get("parent_uid")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                (s, d, p)
+            }
+            _ => (payload.to_string(), String::new(), String::new()),
+        };
     let summary = summary_owned.trim();
     if summary.is_empty() {
         anyhow::bail!("summary cannot be empty");
     }
     let due = due_owned.trim();
     let due_opt = if due.is_empty() { None } else { Some(due) };
+    let parent_uid = parent_uid_owned.trim();
+    let parent_uid_opt = if parent_uid.is_empty() {
+        None
+    } else {
+        Some(parent_uid)
+    };
 
     let cal_href = active_list_href(db)?;
 
+    if let Some(parent_uid) = parent_uid_opt {
+        let parent = db::get_cached_task_by_uid(db, &cal_href, parent_uid)?;
+        if parent.is_none() {
+            anyhow::bail!("parent task not found");
+        }
+        // V1 deliberately supports one nesting level. The UI already hides
+        // "Add subtask" on child tasks; keep the invariant in the backend too.
+        if db::parent_uids(db, &cal_href)?.contains_key(parent_uid) {
+            anyhow::bail!("subtasks v1 supports one level of nesting");
+        }
+    }
+
     let uid = Uuid::new_v4().to_string();
     if db::is_local_list(&cal_href) {
-        db::create_local_with_anchor(db, &uid, summary, None, due_opt)?;
-        Ok(format!("Created local task \"{summary}\""))
+        if let Some(parent_uid) = parent_uid_opt {
+            db::create_local_subtask(db, &uid, summary, parent_uid, due_opt)?;
+            Ok(format!("Created local subtask \"{summary}\""))
+        } else {
+            db::create_local_with_anchor(db, &uid, summary, None, due_opt)?;
+            Ok(format!("Created local task \"{summary}\""))
+        }
+    } else if let Some(parent_uid) = parent_uid_opt {
+        let op_id =
+            db::enqueue_create_subtask(db, &cal_href, &uid, summary, parent_uid, due_opt)?;
+        Ok(format!("Queued: create subtask \"{summary}\" (#{op_id})"))
     } else {
         let op_id = db::enqueue_create_with_anchor(db, &cal_href, &uid, summary, None, due_opt)?;
         Ok(format!("Queued: create \"{summary}\" (#{op_id})"))
