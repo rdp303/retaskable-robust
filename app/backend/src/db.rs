@@ -415,8 +415,10 @@ pub fn upsert_task(
             "SELECT href FROM task WHERE calendar_href = ?1 AND uid = ?2
              ORDER BY CASE WHEN href = ?3 THEN 0 WHEN href LIKE 'pending:%' THEN 1 ELSE 2 END, href",
         )?;
-        stmt.query_map(params![calendar_href, uid, task_href], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+        let rows = stmt.query_map(params![calendar_href, uid, task_href], |r| {
+            r.get::<_, String>(0)
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
 
     if existing_hrefs.is_empty() {
