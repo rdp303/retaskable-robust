@@ -1,0 +1,10 @@
+[Unit]
+Description=reMarkable captive portal session
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/root/xovi/exthome/appload/captive-portal/portal-session.sh
+TimeoutStopSec=8
+KillMode=control-group
+ExecStopPost=-/bin/systemctl start xochitl
