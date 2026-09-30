@@ -1,0 +1,8 @@
+{
+  "id": "captive-portal",
+  "name": "Captive Wi-Fi",
+  "version": "0.1.0-poc",
+  "description": "Enables automatic Wi-Fi sign-in portals without exposing a normal browser.",
+  "application": "enable.sh",
+  "qtfb": false
+}
